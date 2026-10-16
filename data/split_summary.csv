@@ -1,0 +1,4 @@
+split,patients,patients_cancer,breasts,breasts_cancer,images,images_cancer
+train,228,125,389,129,686,231
+val,49,27,88,27,159,49
+test,49,27,89,27,158,51
