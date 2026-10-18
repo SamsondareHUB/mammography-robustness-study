@@ -20,6 +20,8 @@ CBIS-DDSM is the proposed primary dataset. The group will confirm access, labels
 - [Team roles](ROLES.md)
 - [Project decisions](DECISIONS.md)
 - [Experiment log](EXPERIMENT_LOG.md)
+- [Prediction CSV format](docs/PREDICTION_OUTPUT.md)
+- [Evaluation metrics](docs/EVALUATION.md)
 
 ## Status
 Project setup and study design are in progress. Dataset, prediction task, models, and experiment settings still need group confirmation.
