@@ -1,4 +1,4 @@
-"""Validate paired mammography predictions and write evaluation-ready outputs."""
+"""Validate mammography predictions and write evaluation-ready outputs."""
 
 from __future__ import annotations
 
@@ -21,6 +21,15 @@ IMAGE_COLUMNS = (
 BREAST_COLUMNS = (
     "patient_id", "breast_side", "label", "score", "model",
     "degradation", "severity", "seed",
+)
+ORIGINAL_CLASSES = {"normal": 0, "benign": 0, "malignant": 1}
+IMAGE_METADATA_COLUMNS = (
+    "case_id", "patient_id", "breast_side", "image_id", "view", "label",
+    "original_class", "score", "model", "degradation", "severity", "seed",
+)
+BREAST_METADATA_COLUMNS = (
+    "patient_id", "breast_side", "label", "view_status", "view_label_conflict",
+    "model", "degradation", "severity", "seed",
 )
 SEVERITIES = {"low", "medium", "high"}
 SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
@@ -46,11 +55,12 @@ class ImagePrediction:
     degradation: str
     severity: str
     seed: int
+    original_class: str | None = None
 
 
 @dataclass(frozen=True)
 class BreastPrediction:
-    """Maximum malignancy score from the CC and MLO views of one breast."""
+    """Maximum available-view malignancy score and breast-level diagnosis."""
 
     patient_id: str
     breast_side: str
@@ -103,7 +113,9 @@ def _condition(row: ImagePrediction | BreastPrediction) -> tuple[str, str]:
 
 def _check_coverage(groups: dict, expected_conditions: Iterable[tuple[str, str]] | None) -> None:
     """Every breast/model/seed must have matching conditions and a clean baseline."""
-    per_run: dict[tuple[str, int], dict[tuple[str, str], set[tuple[str, str]]]] = defaultdict(lambda: defaultdict(set))
+    per_run: dict[
+        tuple[str, int], dict[tuple[str, str], set[tuple[str, str]]]
+    ] = defaultdict(lambda: defaultdict(set))
     for patient, side, model, degradation, severity, seed in groups:
         per_run[(model, seed)][(patient, side)].add((degradation, severity))
     expected = set(expected_conditions) if expected_conditions is not None else None
@@ -142,14 +154,19 @@ def _breast_sort(row: BreastPrediction) -> tuple:
 def _validated_images(
     records: Iterable[ImagePrediction], *,
     expected_conditions: Iterable[tuple[str, str]] | None = None,
-) -> tuple[list[ImagePrediction], dict[tuple[str, str, str, str, str, int], list[ImagePrediction]]]:
+) -> tuple[
+    list[ImagePrediction],
+    dict[tuple[str, str, str, str, str, int], list[ImagePrediction]],
+]:
+    """Validate image identity, label provenance, and comparison coverage."""
     rows = list(records)
     if not rows:
         raise ValueError("No image predictions supplied")
+
     groups: dict[tuple[str, str, str, str, str, int], list[ImagePrediction]] = defaultdict(list)
     image_owner: dict[str, tuple[str, str, str, str]] = {}
-    breast_labels: dict[tuple[str, str], int] = {}
-    case_owner: dict[str, tuple[str, str]] = {}
+    image_labels: dict[str, tuple[int, str | None]] = {}
+    case_owner: dict[str, str] = {}
     image_by_key: set[tuple[str, str, str, str, int]] = set()
 
     for row in rows:
@@ -160,19 +177,27 @@ def _validated_images(
             _nonempty(getattr(row, name), name)
         if row.view not in {"CC", "MLO"}:
             raise ValueError("view must be CC or MLO")
-        breast = (row.patient_id, row.breast_side)
-        if breast in breast_labels and breast_labels[breast] != row.label:
-            raise ValueError(f"Conflicting breast labels for {breast}")
-        breast_labels[breast] = row.label
+        if row.original_class is not None:
+            if row.original_class not in ORIGINAL_CLASSES:
+                raise ValueError(
+                    f"Unknown original_class for {row.image_id}: "
+                    f"{row.original_class!r}"
+                )
+            if ORIGINAL_CLASSES[row.original_class] != row.label:
+                raise ValueError(f"original_class and label disagree for {row.image_id}")
+
         owner = (row.case_id, row.patient_id, row.breast_side, row.view)
         if row.image_id in image_owner and image_owner[row.image_id] != owner:
             raise ValueError(f"Inconsistent image_id ownership: {row.image_id}")
         image_owner[row.image_id] = owner
-        # One source case may legitimately contain images of both breasts.
-        case_key = (row.case_id, row.patient_id)
-        if row.case_id in case_owner and case_owner[row.case_id][1] != row.patient_id:
+        diagnosis = (row.label, row.original_class)
+        if row.image_id in image_labels and image_labels[row.image_id] != diagnosis:
+            raise ValueError(f"Inconsistent image annotations: {row.image_id}")
+        image_labels[row.image_id] = diagnosis
+        if row.case_id in case_owner and case_owner[row.case_id] != row.patient_id:
             raise ValueError(f"case_id spans different patients: {row.case_id}")
-        case_owner[row.case_id] = case_key
+        case_owner[row.case_id] = row.patient_id
+
         key = (row.image_id, row.model, row.degradation, row.severity, int(row.seed))
         if key in image_by_key:
             raise ValueError(f"Duplicate image prediction: {key}")
@@ -181,10 +206,16 @@ def _validated_images(
                 row.degradation, row.severity, int(row.seed))].append(row)
 
     views_by_group: dict[tuple[str, str, str, str, str, int], dict[str, str]] = {}
-    for key, views in groups.items():
-        mapping = {r.view: r.image_id for r in views}
-        if len(views) != 2 or set(mapping) != {"CC", "MLO"}:
-            raise ValueError(f"Expected one CC and one MLO image for {key}")
+    for key, images in groups.items():
+        mapping = {r.view: r.image_id for r in images}
+        if len(images) != len(mapping):
+            raise ValueError(
+                f"Repeated acquisition for {key}: the current image-level CSV "
+                "cannot identify multiple images of the same view. "
+                "Keep the source records; an evaluation inclusion rule is required."
+            )
+        if not 1 <= len(images) <= 2:
+            raise ValueError(f"Expected one or two available CC/MLO views for {key}")
         views_by_group[key] = mapping
 
     reference_image_sets: dict[tuple[str, str], dict[str, str]] = {}
@@ -207,15 +238,82 @@ def aggregate_breast_predictions(
     records: Iterable[ImagePrediction], *,
     expected_conditions: Iterable[tuple[str, str]] | None = None,
 ) -> list[BreastPrediction]:
-    """Aggregate CC/MLO using the protocol's fixed maximum-score rule."""
+    """Use malignant-over-nonmalignant ground truth and maximum view score."""
     _, groups = _validated_images(records, expected_conditions=expected_conditions)
     out = []
     for (patient, side, model, degradation, severity, seed), rows in groups.items():
         out.append(BreastPrediction(
-            patient, side, rows[0].label, max(float(r.score) for r in rows),
+            patient, side, max(r.label for r in rows), max(float(r.score) for r in rows),
             model, degradation, severity, seed,
         ))
     return sorted(out, key=_breast_sort)
+
+
+def image_analysis_metadata(
+    records: Iterable[ImagePrediction], *,
+    expected_conditions: Iterable[tuple[str, str]] | None = None,
+) -> list[dict[str, object]]:
+    """Return source-level annotations with stable image identifiers."""
+    rows, _ = _validated_images(records, expected_conditions=expected_conditions)
+    if any(r.original_class is None for r in rows):
+        raise ValueError("original_class must be supplied for all analysis metadata rows")
+    return [
+        {column: getattr(row, column) for column in IMAGE_METADATA_COLUMNS}
+        for row in rows
+    ]
+
+
+def breast_analysis_metadata(
+    records: Iterable[ImagePrediction], *,
+    expected_conditions: Iterable[tuple[str, str]] | None = None,
+) -> list[dict[str, object]]:
+    """Return view availability and image-label disagreement by breast and run."""
+    _, groups = _validated_images(records, expected_conditions=expected_conditions)
+    result = []
+    for (patient, side, model, degradation, severity, seed), rows in groups.items():
+        result.append({
+            "patient_id": patient, "breast_side": side,
+            "label": max(r.label for r in rows),
+            "view_status": "paired" if len(rows) == 2 else "single",
+            "view_label_conflict": int(len({r.label for r in rows}) > 1),
+            "model": model, "degradation": degradation,
+            "severity": severity, "seed": seed,
+        })
+    return sorted(
+        result,
+        key=lambda row: (
+            row["model"], row["seed"], row["patient_id"],
+            row["breast_side"], row["degradation"] != "clean",
+            row["degradation"], SEVERITY_ORDER[row["severity"]],
+        ),
+    )
+
+
+def _write_metadata_csv(rows: list[dict[str, object]], columns: tuple[str, ...],
+                        path: str | Path) -> None:
+    """Write prevalidated supplementary metadata, not evaluation inputs."""
+    with Path(path).open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_image_metadata_csv(
+    records: Iterable[ImagePrediction], path: str | Path, *,
+    expected_conditions: Iterable[tuple[str, str]] | None = None,
+) -> None:
+    """Export source image identity and original three-class diagnosis."""
+    rows = image_analysis_metadata(records, expected_conditions=expected_conditions)
+    _write_metadata_csv(rows, IMAGE_METADATA_COLUMNS, path)
+
+
+def write_breast_metadata_csv(
+    records: Iterable[ImagePrediction], path: str | Path, *,
+    expected_conditions: Iterable[tuple[str, str]] | None = None,
+) -> None:
+    """Export view status and image-label disagreement for later analysis."""
+    rows = breast_analysis_metadata(records, expected_conditions=expected_conditions)
+    _write_metadata_csv(rows, BREAST_METADATA_COLUMNS, path)
 
 
 def _write_csv(rows: list, columns: tuple[str, ...], path: str | Path) -> None:
@@ -331,7 +429,9 @@ def export_prediction_tables(
     staged: list[Path] = []
     try:
         for target in (image_target, breast_target):
-            fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+            fd, name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+            )
             os.close(fd)
             staged.append(Path(name))
         write_image_csv(rows, staged[0], expected_conditions=expected)

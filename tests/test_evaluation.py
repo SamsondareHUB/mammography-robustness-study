@@ -42,6 +42,34 @@ def write_csv(path, header, rows):
         writer.writerows(rows)
 
 
+class ExportIntegrationTests(unittest.TestCase):
+    def test_evaluator_loads_single_view_and_conflicting_view_labels(self):
+        from mammography_robustness.predictions import ImagePrediction
+
+        rows = [
+            ImagePrediction("case-p16", "p16", "R", "cc16", "CC", 0, 0.2,
+                            "model", "clean", "none", 1, original_class="normal"),
+            ImagePrediction("case-p16", "p16", "R", "mlo16", "MLO", 1, 0.8,
+                            "model", "clean", "none", 1, original_class="malignant"),
+            ImagePrediction("case-p20", "p20", "L", "cc20", "CC", 0, 0.1,
+                            "model", "clean", "none", 1, original_class="benign"),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "image.csv"
+            breast_path = Path(temp) / "breast.csv"
+            export_prediction_tables(rows, image_path, breast_path)
+            image_frame, image_level = load_predictions(image_path)
+            breast_frame, breast_level = load_predictions(breast_path)
+            self.assertEqual(image_level, "image")
+            self.assertEqual(breast_level, "breast")
+            self.assertEqual(len(image_frame), 3)
+            self.assertEqual(len(breast_frame), 2)
+            self.assertEqual(image_frame["label"].tolist(), [0, 1, 0])
+            self.assertEqual(breast_frame["label"].tolist(), [1, 0])
+            threshold_map = validation_thresholds(breast_frame)
+            self.assertEqual(threshold_map[("model", 1)][0], 0.8)
+
+
 class MetricTests(unittest.TestCase):
     def test_auc_with_ties(self):
         # Pairs (pos, neg): (0.8>0.2), (0.8>0.5), (0.5=0.5 -> 0.5), (0.5>0.2) => 3.5 / 4
@@ -124,7 +152,8 @@ class EvaluationTests(unittest.TestCase):
         a = evaluate_predictions(frame, "breast", thresholds, n_bootstrap=200, bootstrap_seed=3)
         b = evaluate_predictions(frame, "breast", thresholds, n_bootstrap=200, bootstrap_seed=3)
         pd.testing.assert_frame_equal(a, b)
-        self.assertTrue((a["auc_ci_low"] <= a["auc"]).all() and (a["auc"] <= a["auc_ci_high"]).all())
+        self.assertTrue((a["auc_ci_low"] <= a["auc"]).all())
+        self.assertTrue((a["auc"] <= a["auc_ci_high"]).all())
         # Removing another model must not change this model's intervals.
         alone = evaluate_predictions(breast_rows(shift=0.2), "breast", thresholds,
                                      n_bootstrap=200, bootstrap_seed=3)
@@ -134,7 +163,8 @@ class EvaluationTests(unittest.TestCase):
         validation = breast_rows(seed=7)
         validation["seed"] = 1
         thresholds = validation_thresholds(validation)
-        expected = youden_threshold(*[validation.query("degradation == 'clean'")[c] for c in ("label", "score")])
+        clean = validation.query("degradation == 'clean'")
+        expected = youden_threshold(clean["label"], clean["score"])
         self.assertEqual(thresholds[("small", 1)], (expected, "youden_validation"))
         result = evaluate_predictions(breast_rows(shift=0.2), "breast", thresholds, n_bootstrap=0)
         self.assertTrue((result["threshold"] == expected).all())
@@ -143,7 +173,9 @@ class EvaluationTests(unittest.TestCase):
 
     def test_summary_over_seeds(self):
         frame = pd.concat([breast_rows(seed=1, shift=0.2), breast_rows(seed=2, shift=0.2)])
-        per_run = evaluate_predictions(frame, "breast", fixed_thresholds(frame, 0.5), n_bootstrap=0)
+        per_run = evaluate_predictions(
+            frame, "breast", fixed_thresholds(frame, 0.5), n_bootstrap=0
+        )
         summary = summarize_over_seeds(per_run)
         self.assertEqual(tuple(summary.columns), SUMMARY_COLUMNS)
         self.assertEqual(len(summary), 2)
@@ -160,11 +192,18 @@ class CommandLineTests(unittest.TestCase):
             label = p % 2
             for view, bump in (("CC", 0.0), ("MLO", 0.1)):
                 score = 0.2 + 0.5 * label + bump
-                for degradation, severity, s in (("clean", "none", score), ("blur", "high", score * 0.8)):
-                    records.append(ImagePrediction(f"c{p}", f"p{p}", "L", f"p{p}-{view}", view, label,
-                                                   s, "small", degradation, severity, 1))
+                conditions = (("clean", "none", score), ("blur", "high", score * 0.8))
+                for degradation, severity, value in conditions:
+                    records.append(
+                        ImagePrediction(
+                            f"c{p}", f"p{p}", "L", f"p{p}-{view}", view,
+                            label, value, "small", degradation, severity, 1,
+                        )
+                    )
         with tempfile.TemporaryDirectory() as temp:
-            images, breasts, out = Path(temp, "img.csv"), Path(temp, "breast.csv"), Path(temp, "metrics")
+            images = Path(temp) / "img.csv"
+            breasts = Path(temp) / "breast.csv"
+            out = Path(temp) / "metrics"
             export_prediction_tables(records, images, breasts)
             main([str(breasts), "--threshold", "youden", "--validation", str(breasts),
                   "--bootstrap", "50", "--out-dir", str(out)])
