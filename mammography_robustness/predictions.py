@@ -23,13 +23,14 @@ BREAST_COLUMNS = (
     "degradation", "severity", "seed",
 )
 ORIGINAL_CLASSES = {"normal": 0, "benign": 0, "malignant": 1}
+BREAST_CLASS_RANK = {"normal": 0, "benign": 1, "malignant": 2}
 IMAGE_METADATA_COLUMNS = (
     "case_id", "patient_id", "breast_side", "image_id", "view", "label",
     "original_class", "score", "model", "degradation", "severity", "seed",
 )
 BREAST_METADATA_COLUMNS = (
-    "patient_id", "breast_side", "label", "view_status", "view_label_conflict",
-    "model", "degradation", "severity", "seed",
+    "patient_id", "breast_side", "label", "original_class", "view_status",
+    "view_label_conflict", "model", "degradation", "severity", "seed",
 )
 SEVERITIES = {"low", "medium", "high"}
 SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
@@ -267,13 +268,18 @@ def breast_analysis_metadata(
     records: Iterable[ImagePrediction], *,
     expected_conditions: Iterable[tuple[str, str]] | None = None,
 ) -> list[dict[str, object]]:
-    """Return view availability and image-label disagreement by breast and run."""
-    _, groups = _validated_images(records, expected_conditions=expected_conditions)
+    """Return breast diagnosis, view availability, and label disagreement."""
+    images, groups = _validated_images(records, expected_conditions=expected_conditions)
+    if any(row.original_class is None for row in images):
+        raise ValueError("original_class must be supplied for all breast metadata rows")
     result = []
     for (patient, side, model, degradation, severity, seed), rows in groups.items():
         result.append({
             "patient_id": patient, "breast_side": side,
             "label": max(r.label for r in rows),
+            "original_class": max(
+                (r.original_class for r in rows), key=BREAST_CLASS_RANK.__getitem__
+            ),
             "view_status": "paired" if len(rows) == 2 else "single",
             "view_label_conflict": int(len({r.label for r in rows}) > 1),
             "model": model, "degradation": degradation,
@@ -311,7 +317,7 @@ def write_breast_metadata_csv(
     records: Iterable[ImagePrediction], path: str | Path, *,
     expected_conditions: Iterable[tuple[str, str]] | None = None,
 ) -> None:
-    """Export view status and image-label disagreement for later analysis."""
+    """Export breast diagnosis, view status, and label disagreement."""
     rows = breast_analysis_metadata(records, expected_conditions=expected_conditions)
     _write_metadata_csv(rows, BREAST_METADATA_COLUMNS, path)
 

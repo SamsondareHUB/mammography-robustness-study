@@ -20,8 +20,9 @@ For each breast, model, seed, and condition:
 
 - The breast-level binary **ground truth** is malignant if **any** available image has `label=1`. An image's own label is never rewritten. In particular, different CC and MLO labels can coexist.
 - The breast-level score is the **maximum** of the available image scores, or the sole score for a single-view breast.
+- `original_class` in the supplementary breast metadata takes the most severe class across the included images: malignant > benign > normal. All original image-level classes must be supplied; no class is inferred from a binary negative label.
 - `view_status` is `single` or `paired` in the supplementary breast metadata.
-- `view_label_conflict` is 1 when the included CC and MLO images have different binary diagnoses, and 0 otherwise. This derived field is **not** interchangeable with the evaluator's separately defined `label_flag` until the team confirms its meaning and source.
+- `view_label_conflict` is 1 when the included CC and MLO images have different binary diagnoses, and 0 otherwise. The evaluator maps this field to `label_flag` for the unflagged sensitivity analysis.
 
 ## Evaluation CSV schemas
 
@@ -43,15 +44,17 @@ The image-level CSV preserves each view's original binary label. The breast-leve
 
 ### Optional supplementary metadata
 
-`write_image_metadata_csv()` writes the stable `image_id` and `original_class` alongside each source prediction; it requires `original_class` on all records. `write_breast_metadata_csv()` writes `view_status` and `view_label_conflict`. These are separate metadata outputs; they are **not** accepted as replacement prediction inputs by the current evaluator.
+`write_image_metadata_csv()` writes the stable `image_id` and `original_class` alongside each source prediction. `write_breast_metadata_csv()` writes `original_class`, `view_status`, and `view_label_conflict`. Both metadata exports require original three-class annotations for every input image. Missing classes cause an error before a metadata CSV is written.
 
-The normal-versus-benign false-positive breakdown and flagged-breast sensitivity analysis require compatible evaluation fields. Verify their definitions and join keys against the revised evaluator before changing the primary CSV schemas.
+The prediction CSV schemas remain unchanged. The evaluator reads supplementary metadata via `--metadata`, joining by patient, breast, model, seed, degradation, and severity. It accepts `single`/`paired` and maps `view_label_conflict` to the flag used for the unflagged sensitivity analysis.
 
 ## Repeated acquisitions
 
-Patients 99 and 281 each have two distinct left-breast MLO acquisitions in the annotation manifest. Keep both in the source records. Do not equate them with a duplicated file, remove one automatically, or choose one using predicted scores.
+Patients 99 (training) and 281 (validation) each have two distinct left-breast MLO acquisitions in the annotation manifest. Retain both source records and preserve the patient-level splits.
 
-The current image-level evaluation key is `(patient_id, breast_side, view, model, seed, degradation, severity)`, which cannot distinguish two acquisitions of the same view. The exporter therefore **rejects repeated views**. Before including either or both acquisitions in the primary analysis, the team must document a reproducible inclusion rule or extend the evaluation key. The same source-image set must be used across all compared conditions.
+The proposed score-independent evaluation rule is to use the unsuffixed `P99_L_DM_MLO` and `P281_L_DM_MLO`, retaining the additional acquisitions in the source dataset. Patient 281's acquisitions remain validation-only and must not be used for training. The team should document and confirm the inclusion rule before preprocessing the final evaluation manifest.
+
+The current image-level evaluation key is `(patient_id, breast_side, view, model, seed, degradation, severity)`, which cannot distinguish two acquisitions of the same view. The exporter still **rejects repeated views**; acquisition selection must happen upstream. The same source-image set must be used across all compared conditions.
 
 ## Example
 

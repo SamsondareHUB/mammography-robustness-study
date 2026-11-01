@@ -80,8 +80,9 @@ class PredictionTests(unittest.TestCase):
         records = [r for r in set_of_views() if r.view == "CC"]
         result = aggregate_breast_predictions(records)
         self.assertEqual([r.score for r in result], [0.2, 0.35])
+        annotated = [replace(r, original_class="malignant") for r in records]
         self.assertEqual(
-            {row["view_status"] for row in breast_analysis_metadata(records)},
+            {row["view_status"] for row in breast_analysis_metadata(annotated)},
             {"single"},
         )
 
@@ -132,18 +133,16 @@ class PredictionTests(unittest.TestCase):
         result = aggregate_breast_predictions(records)
         self.assertEqual({r.label for r in result}, {1})
         self.assertEqual([r.score for r in result], [0.6, 0.5])
-        image_rows = image_analysis_metadata(
-            [
-                replace(row, original_class="malignant" if row.label else "normal")
-                for row in records
-            ]
-        )
+        annotated = [
+            replace(row, original_class="malignant" if row.label else "normal")
+            for row in records
+        ]
+        image_rows = image_analysis_metadata(annotated)
         self.assertEqual([r["label"] for r in image_rows if r["view"] == "CC"], [0, 0])
         self.assertEqual([r["label"] for r in image_rows if r["view"] == "MLO"], [1, 1])
-        self.assertEqual(
-            {row["view_label_conflict"] for row in breast_analysis_metadata(records)},
-            {1},
-        )
+        breast_rows = breast_analysis_metadata(annotated)
+        self.assertEqual({row["view_label_conflict"] for row in breast_rows}, {1})
+        self.assertEqual({row["original_class"] for row in breast_rows}, {"malignant"})
 
     def test_original_three_class_mapping_checked(self):
         records = [replace(r, original_class="malignant") for r in set_of_views()]
@@ -184,6 +183,7 @@ class PredictionTests(unittest.TestCase):
             self.assertEqual(len(image_rows), 2)
             self.assertEqual(breast_rows[0]["score"], "0.6")
             self.assertEqual(image_metadata[0]["original_class"], "malignant")
+            self.assertEqual(breast_metadata[0]["original_class"], "malignant")
             self.assertEqual(breast_metadata[0]["view_status"], "single")
             self.assertEqual(breast_metadata[0]["view_label_conflict"], "0")
 
@@ -198,6 +198,17 @@ class PredictionTests(unittest.TestCase):
             {"normal", "benign"},
         )
         self.assertEqual({r.label for r in aggregate_breast_predictions(normalized)}, {0})
+        self.assertEqual(
+            {row["original_class"] for row in breast_analysis_metadata(normalized)},
+            {"benign"},
+        )
+
+    def test_breast_metadata_rejects_missing_original_class(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "breast_metadata.csv"
+            with self.assertRaisesRegex(ValueError, "original_class must be supplied"):
+                write_breast_metadata_csv(set_of_views(), path)
+            self.assertFalse(path.exists())
 
     def test_repeated_mlo_acquisitions_need_inclusion_rule(self):
         examples = (
