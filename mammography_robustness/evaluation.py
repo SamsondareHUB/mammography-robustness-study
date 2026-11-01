@@ -38,6 +38,9 @@ VIEW_STATUS = "view_status"
 ORIGINAL_CLASS = "original_class"
 LABEL_FLAG = "label_flag"
 OPTIONAL_COLUMNS = (VIEW_STATUS, ORIGINAL_CLASS, LABEL_FLAG)
+# The exporter's metadata CSVs name some fields differently.
+METADATA_ALIASES = {"view_label_conflict": LABEL_FLAG}
+VIEW_STATUS_ALIASES = {"single": "single_view", "paired": "paired_view"}
 VIEW_COUNTS = {"single_view": 1, "paired_view": 2}
 ORIGINAL_CLASSES = ("normal", "benign", "malignant")
 FLAG_VALUES = {"0": 0, "1": 1, "false": 0, "true": 1}
@@ -118,8 +121,8 @@ def validate_predictions(frame: pd.DataFrame, level: str) -> pd.DataFrame:
     df["seed"] = df["seed"].astype(int)
 
     if VIEW_STATUS in df:
-        df[VIEW_STATUS] = df[VIEW_STATUS].str.lower()
-        _fail(~df[VIEW_STATUS].isin(VIEW_COUNTS), "view_status must be single_view or paired_view")
+        df[VIEW_STATUS] = df[VIEW_STATUS].str.lower().replace(VIEW_STATUS_ALIASES)
+        _fail(~df[VIEW_STATUS].isin(VIEW_COUNTS), "view_status must be single(_view) or paired(_view)")
     if ORIGINAL_CLASS in df:
         df[ORIGINAL_CLASS] = df[ORIGINAL_CLASS].str.lower()
         _fail(~df[ORIGINAL_CLASS].isin(ORIGINAL_CLASSES), "original_class must be normal, benign or malignant")
@@ -154,14 +157,59 @@ def validate_predictions(frame: pd.DataFrame, level: str) -> pd.DataFrame:
     return df
 
 
-def load_predictions(path: str | Path) -> tuple[pd.DataFrame, str]:
-    """Read an image- or breast-level CSV; the level is detected from its header."""
+def attach_metadata(frame: pd.DataFrame, metadata: pd.DataFrame, level: str) -> pd.DataFrame:
+    """Add optional columns from a separate metadata CSV to a raw prediction table.
+
+    Rows are matched on the evaluation unit plus model, seed and condition.
+    Both tables must cover exactly the same rows, and a ``label`` column in
+    the metadata must agree with the predictions. Other metadata columns
+    (for example ``image_id`` or ``score``) are ignored.
+    """
+    keys = [*UNIT_COLUMNS[level], "model", "seed", "degradation", "severity"]
+    metadata = metadata.rename(columns=METADATA_ALIASES)
+    missing = [k for k in keys if k not in metadata.columns]
+    if missing:
+        raise ValueError(f"metadata is missing join columns {missing}")
+    fields = [c for c in OPTIONAL_COLUMNS if c in metadata.columns]
+    if not fields:
+        raise ValueError(f"metadata has none of {', '.join([*OPTIONAL_COLUMNS, *METADATA_ALIASES])}")
+    clash = [c for c in fields if c in frame.columns]
+    if clash:
+        raise ValueError(f"{clash} appear in both the predictions and the metadata")
+    checks = ["label"] if "label" in metadata.columns else []
+    meta = metadata[keys + checks + fields]
+    if meta.duplicated(keys).any():
+        raise ValueError(f"metadata has more than one row for {dict(meta[meta.duplicated(keys)].iloc[0][keys])}")
+
+    merged = frame.merge(meta, on=keys, how="left", suffixes=("", "_metadata"), indicator=True)
+    unmatched = merged[merged["_merge"] != "both"]
+    if not unmatched.empty:
+        raise ValueError(f"no metadata row for prediction {dict(unmatched.iloc[0][keys])}")
+    extra = meta.merge(frame[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+    extra = extra[extra["_merge"] != "both"]
+    if not extra.empty:
+        raise ValueError(f"metadata row has no matching prediction: {dict(extra.iloc[0][keys])}")
+    if checks:
+        differs = merged["label"] != merged["label_metadata"]
+        if differs.any():
+            raise ValueError(f"metadata label disagrees with predictions for {dict(merged[differs].iloc[0][keys])}")
+    return merged[[*frame.columns, *fields]]
+
+
+def load_predictions(path: str | Path, metadata: str | Path | None = None) -> tuple[pd.DataFrame, str]:
+    """Read an image- or breast-level CSV, optionally joined with its metadata CSV.
+
+    The level is detected from the prediction header.
+    """
     frame = pd.read_csv(path, dtype=str, keep_default_na=False)
     level = "image" if {"case_id", "view"} & set(frame.columns) else "breast"
     try:
+        if metadata is not None:
+            frame = attach_metadata(frame, pd.read_csv(metadata, dtype=str, keep_default_na=False), level)
         return validate_predictions(frame, level), level
     except ValueError as error:
-        raise ValueError(f"{path}: {error}") from None
+        source = f"{path} + {metadata}" if metadata is not None else f"{path}"
+        raise ValueError(f"{source}: {error}") from None
 
 
 # --------------------------------------------------------------------------
@@ -443,6 +491,7 @@ def evaluation_metadata(args: argparse.Namespace, level: str, thresholds: Thresh
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "level": level,
         "predictions": _file_record(args.predictions),
+        "metadata": _file_record(args.metadata) if args.metadata else None,
         "validation": _file_record(args.validation) if args.validation else None,
         "threshold_rule": args.threshold if isinstance(args.threshold, str) else "fixed",
         "thresholds": [
@@ -473,6 +522,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("predictions", help="test-set image- or breast-level prediction CSV")
     parser.add_argument("--threshold", type=_parse_threshold, default=0.5,
                         help="fixed threshold (default 0.5) or 'youden' to select it on --validation")
+    parser.add_argument("--metadata",
+                        help="metadata CSV for the predictions (view_status, original_class, "
+                             "view_label_conflict), joined on breast/image, model, seed and condition")
     parser.add_argument("--validation", help="validation-set CSV at the same level, required for 'youden'")
     parser.add_argument("--clean-only", action="store_true",
                         help="evaluate only the clean baseline rows of the predictions CSV")
@@ -483,7 +535,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out-dir", default="outputs/metrics", help="output directory (default outputs/metrics)")
     args = parser.parse_args(argv)
 
-    predictions, level = load_predictions(args.predictions)
+    predictions, level = load_predictions(args.predictions, args.metadata)
     if args.clean_only:
         predictions = predictions[predictions["degradation"] == "clean"].reset_index(drop=True)
     if isinstance(args.threshold, str):

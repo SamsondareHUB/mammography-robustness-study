@@ -221,7 +221,80 @@ class OptionalColumnTests(unittest.TestCase):
         self.assertEqual(len(validate_predictions(frame, "image")), 3)
 
 
+# Column layout of the exporter's breast metadata CSV (write_breast_metadata_csv).
+EXPORTER_BREAST_METADATA = ("patient_id", "breast_side", "label", "view_status", "view_label_conflict",
+                            "model", "degradation", "severity", "seed")
+
+
+def exporter_breast_metadata(predictions):
+    """Metadata in the exporter's format: p3 single-view, p4's left breast has conflicting views."""
+    meta = predictions.copy()
+    meta["view_status"] = np.where(meta["patient_id"] == "p3", "single", "paired")
+    meta["view_label_conflict"] = ((meta["patient_id"] == "p4") & (meta["breast_side"] == "L")).astype(int)
+    return meta[list(EXPORTER_BREAST_METADATA)]
+
+
+class MetadataTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.predictions = breast_rows(shift=0.2)
+        self.pred_path = Path(self.temp.name, "breast.csv")
+        self.meta_path = Path(self.temp.name, "breast_meta.csv")
+        self.predictions.to_csv(self.pred_path, index=False)
+
+    def load_with(self, metadata):
+        metadata.to_csv(self.meta_path, index=False)
+        return load_predictions(self.pred_path, self.meta_path)
+
+    def test_joins_exporter_metadata_and_maps_names(self):
+        frame, level = self.load_with(exporter_breast_metadata(self.predictions))
+        self.assertEqual(level, "breast")
+        self.assertEqual(set(frame["view_status"]), {"single_view", "paired_view"})
+        self.assertEqual(frame["label_flag"].sum(), 2)  # p4 left, clean + noise
+        result = evaluate_predictions(frame, "breast", fixed_thresholds(frame, 0.5), n_bootstrap=0)
+        clean = result[result["degradation"] == "clean"].set_index("subset")
+        self.assertEqual(clean.loc["single_view", "n_units"], 2)
+        self.assertEqual(clean.loc["unflagged", "n_units"], 23)
+
+    def test_metadata_row_order_does_not_matter(self):
+        metadata = exporter_breast_metadata(self.predictions).iloc[::-1]
+        frame, _ = self.load_with(metadata)
+        pd.testing.assert_series_equal(frame["score"], self.predictions["score"])
+
+    def test_rejects_mismatched_metadata(self):
+        good = exporter_breast_metadata(self.predictions)
+        cases = {
+            "missing row": good.iloc[1:],
+            "extra row": pd.concat([good, good.iloc[[0]].assign(seed=9)]),
+            "duplicate row": pd.concat([good, good.iloc[[0]]]),
+            "label disagrees": good.assign(label=1 - good["label"]),
+            "no join column": good.drop(columns="seed"),
+            "no useful field": good.drop(columns=["view_status", "view_label_conflict"]),
+        }
+        for name, metadata in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                self.load_with(metadata)
+
+    def test_rejects_field_in_both_files(self):
+        self.predictions.assign(view_status="paired_view").to_csv(self.pred_path, index=False)
+        with self.assertRaises(ValueError):
+            self.load_with(exporter_breast_metadata(self.predictions))
+
+
 class CommandLineTests(unittest.TestCase):
+    def test_metadata_option(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pred, meta, out = Path(temp, "b.csv"), Path(temp, "m.csv"), Path(temp, "metrics")
+            predictions = breast_rows(shift=0.2)
+            predictions.to_csv(pred, index=False)
+            exporter_breast_metadata(predictions).to_csv(meta, index=False)
+            main([str(pred), "--metadata", str(meta), "--bootstrap", "0", "--out-dir", str(out)])
+            result = pd.read_csv(out / "breast_metrics_by_run.csv")
+            info = json.loads((out / "breast_evaluation_metadata.json").read_text())
+        self.assertEqual(set(result["subset"]), {"all", "paired_view", "single_view", "unflagged"})
+        self.assertEqual(info["metadata"]["path"], str(meta))
+
     def test_clean_only_and_metadata(self):
         with tempfile.TemporaryDirectory() as temp:
             test_path, val_path, out = Path(temp, "test.csv"), Path(temp, "val.csv"), Path(temp, "metrics")
