@@ -1,20 +1,32 @@
 # Prediction exports
 
-`mammography_robustness.predictions` checks paired image predictions, produces breast-level scores and writes the two CSV formats defined in the evaluation protocol. It does not load mammograms, train models, assign pathology labels, compute metrics or measure inference cost.
+`mammography_robustness.predictions` validates image-level predictions, aggregates breast-level scores, and writes CSVs consumed by the current evaluator. It does not run model inference or calculate evaluation metrics.
 
-## Inputs and identifiers
+## Input records
 
-`ImagePrediction` requires `case_id`, `patient_id`, `breast_side`, `image_id`, `view`, `label`, `score`, `model`, `degradation`, `severity`, and `seed`. The internal `image_id` identifies a source image across model runs and degradation conditions; it is not exported to the agreed CSV.
+Each `ImagePrediction` specifies `case_id`, `patient_id`, `breast_side`, `image_id`, `view`, `label`, `score`, `model`, `degradation`, `severity`, and `seed`. `original_class` is optional and can hold `normal`, `benign`, or `malignant`.
 
-- `patient_id` is used to prevent patients from crossing training, validation and test partitions.
-- `breast_side` is normalized to `L` or `R`. Together with `patient_id`, it identifies the breast-level evaluation unit.
-- `case_id` preserves the source case identifier and may cover both breasts of one patient; it is not used for patient-disjoint splitting.
-- `view` is normalized to `CC` or `MLO`. Each evaluated breast must have exactly one of each view. Missing/duplicate views are rejected, not filled in.
-- `label` is 1 for malignant and 0 for benign/normal, provided the source annotations support that mapping. Scores must be finite in [0, 1]. A model output score is **not** necessarily calibrated cancer risk.
+- `image_id` identifies a single source acquisition across model runs, seeds, and degradation conditions. It is kept internally and in the supplementary image metadata export.
+- `case_id` is the dataset identifier. `patient_id` and `breast_side` identify a breast for aggregation and patient-level analysis.
+- `label` is the original **image-level** binary annotation: malignant = 1, normal or benign = 0. The exporter verifies that `original_class`, when supplied, agrees with this mapping.
+- `view` must be `CC` or `MLO`. Either a single available view or a CC/MLO pair is valid.
+- `score` is the model's finite malignancy score in [0, 1], not necessarily a calibrated clinical probability.
 
-Dataset labels, laterality and view mapping must be verified from the source metadata by the dataset-preparation workflow before exporting predictions.
+Input validation requires stable image identifiers, unchanged source annotations, a clean baseline per model/seed, and matching image coverage across evaluation conditions. It rejects different source-image selections across models or seeds.
 
-## Output schemas
+## Breast aggregation
+
+For each breast, model, seed, and condition:
+
+- The breast-level binary **ground truth** is malignant if **any** available image has `label=1`. An image's own label is never rewritten. In particular, different CC and MLO labels can coexist.
+- The breast-level score is the **maximum** of the available image scores, or the sole score for a single-view breast.
+- `original_class` in the supplementary breast metadata takes the most severe class across the included images: malignant > benign > normal. All original image-level classes must be supplied; no class is inferred from a binary negative label.
+- `view_status` is `single` or `paired` in the supplementary breast metadata.
+- `view_label_conflict` is 1 when the included CC and MLO images have different binary diagnoses, and 0 otherwise. The evaluator maps this field to `label_flag` for the unflagged sensitivity analysis.
+
+## Evaluation CSV schemas
+
+The prediction CSVs retain the agreed column order and remain compatible with the current evaluator.
 
 Image-level predictions:
 
@@ -28,9 +40,21 @@ Breast-level predictions:
 patient_id,breast_side,label,score,model,degradation,severity,seed
 ```
 
-Each image receives a clean baseline (`degradation=clean`, `severity=none`) for each model and training seed. Degraded conditions use `low`, `medium` or `high` severity. When `expected_conditions` is supplied, export requires the exact condition grid plus the clean baseline for every breast/model/seed.
+The image-level CSV preserves each view's original binary label. The breast-level CSV uses the aggregated ground truth. Both use `degradation=clean` and `severity=none` for baseline records; degraded records use `low`, `medium`, or `high` severity. When `expected_conditions` is supplied, those conditions plus clean must appear for each breast/model/seed.
 
-The breast score is always the **maximum** of that breast's CC and MLO image scores. Input pairs must be identical across models, seeds and degradation settings. The image-to-breast export checks these requirements with stable internal `image_id` values and sorts both exports deterministically. `write_breast_csv` can also serialize previously computed breast scores, but cannot independently establish how those scores were aggregated. Use `export_prediction_tables` when both outputs must be derived from the same image predictions.
+### Optional supplementary metadata
+
+`write_image_metadata_csv()` writes the stable `image_id` and `original_class` alongside each source prediction. `write_breast_metadata_csv()` writes `original_class`, `view_status`, and `view_label_conflict`. Both metadata exports require original three-class annotations for every input image. Missing classes cause an error before a metadata CSV is written.
+
+The prediction CSV schemas remain unchanged. The evaluator reads supplementary metadata via `--metadata`, joining by patient, breast, model, seed, degradation, and severity. It accepts `single`/`paired` and maps `view_label_conflict` to the flag used for the unflagged sensitivity analysis.
+
+## Repeated acquisitions
+
+Patients 99 (training) and 281 (validation) each have two distinct left-breast MLO acquisitions in the annotation manifest. Retain both source records and preserve the patient-level splits.
+
+The proposed score-independent evaluation rule is to use the unsuffixed `P99_L_DM_MLO` and `P281_L_DM_MLO`, retaining the additional acquisitions in the source dataset. Patient 281's acquisitions remain validation-only and must not be used for training. The team should document and confirm the inclusion rule before preprocessing the final evaluation manifest.
+
+The current image-level evaluation key is `(patient_id, breast_side, view, model, seed, degradation, severity)`, which cannot distinguish two acquisitions of the same view. The exporter still **rejects repeated views**; acquisition selection must happen upstream. The same source-image set must be used across all compared conditions.
 
 ## Example
 
@@ -39,31 +63,28 @@ from pathlib import Path
 from mammography_robustness.predictions import ImagePrediction, export_prediction_tables
 
 rows = [
-    ImagePrediction("c1", "p1", "L", "im-cc", "CC", 1, 0.3, "small", "clean", "none", 1),
-    ImagePrediction("c1", "p1", "L", "im-mlo", "MLO", 1, 0.8, "small", "clean", "none", 1),
-    ImagePrediction("c1", "p1", "L", "im-cc", "CC", 1, 0.2, "small", "blur", "low", 1),
-    ImagePrediction("c1", "p1", "L", "im-mlo", "MLO", 1, 0.6, "small", "blur", "low", 1),
+    ImagePrediction("case-1", "p1", "R", "p1-r-cc", "CC", 0, 0.2,
+                    "baseline", "clean", "none", 1, original_class="normal"),
+    ImagePrediction("case-1", "p1", "R", "p1-r-mlo", "MLO", 1, 0.7,
+                    "baseline", "clean", "none", 1, original_class="malignant"),
 ]
 
 Path("outputs").mkdir(exist_ok=True)
-export_prediction_tables(rows, "outputs/image_predictions.csv", "outputs/breast_predictions.csv",
-                         expected_conditions=[("blur", "low")])
+export_prediction_tables(rows, "outputs/image_predictions.csv", "outputs/breast_predictions.csv")
 ```
 
-The example uses synthetic identifiers and scores. The CSVs contain four image rows and two breast rows; the breast scores are 0.8 (clean) and 0.6 (blur/low). The export writes temporary files before replacing either destination to avoid leaving a partial output pair when validation or staging fails. Two separate file replacements are not a transactional operation.
+For this synthetic example, the image labels remain 0 and 1, the breast label is 1, and the breast score is 0.7.
 
-## Split counts
+Both output tables are validated before writing. The exporter stages their complete contents before replacing the output paths, although replacing two separate files is not a filesystem transaction.
 
-`SplitImage` holds `patient_id`, `breast_side`, `image_id`, and `split` (`train`, `validation`, `test`). Use `write_split_summary_json` on the **full dataset manifest**, not just test predictions, to obtain distinct patient, breast, and image counts. It rejects any patient appearing in multiple partitions. The module does not construct a split, verify the provenance of supplied identifiers, or cross-check the split manifest against exported predictions. The dataset pipeline must ensure predictions come from the intended held-out partition.
+## Split summary and scope
 
-## Checks and limits
+`SplitImage` holds `patient_id`, `breast_side`, `image_id`, and `split`. Use `write_split_summary_json()` with the **full manifest** to count distinct patients, breasts, and images and detect patients assigned to multiple partitions. It does not independently establish file provenance or match test predictions against the original split manifest.
+
+Run all project tests with:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Requires Python 3.10 or later. Tests use synthetic records only; they do not establish correctness of dataset annotations, predictive performance, calibration or clinical utility.
-
-The export currently assumes paired CC/MLO views; it will fail for breasts without both rather than silently changing the evaluation sample. Missing-view handling and inclusion criteria need to be specified before running the study. Transformation intensities, model choice, data access and train/validation/test partitions must also be recorded separately.
-
-Do not commit patient-identifiable or restricted data. Local exports belong in an ignored directory such as `outputs/`; verify dataset licensing and sharing permissions before distributing files.
+Tests use synthetic predictions and do not establish model performance. Before exporting real validation or test predictions, verify annotation provenance, acquisition inclusion criteria, and compatibility with the evaluation code. Do not commit mammograms or other restricted data.
