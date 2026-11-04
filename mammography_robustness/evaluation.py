@@ -7,8 +7,12 @@ See docs/EVALUATION.md for the protocol and output columns.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
+import platform
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
@@ -28,10 +32,26 @@ UNIT_COLUMNS = {
 CLEAN = ("clean", "none")
 THRESHOLD_METHODS = ("youden",)
 
+# Optional columns agreed after the original format. Rename here if the
+# export uses different names.
+VIEW_STATUS = "view_status"
+ORIGINAL_CLASS = "original_class"
+LABEL_FLAG = "label_flag"
+OPTIONAL_COLUMNS = (VIEW_STATUS, ORIGINAL_CLASS, LABEL_FLAG)
+# The exporter's metadata CSVs name some fields differently.
+METADATA_ALIASES = {"view_label_conflict": LABEL_FLAG}
+VIEW_STATUS_ALIASES = {"single": "single_view", "paired": "paired_view"}
+VIEW_COUNTS = {"single_view": 1, "paired_view": 2}
+ORIGINAL_CLASSES = ("normal", "benign", "malignant")
+FLAG_VALUES = {"0": 0, "1": 1, "false": 0, "true": 1}
+SUBSETS = ("all", "paired_view", "single_view", "unflagged")
+CLASS_COUNT_COLUMNS = ("n_normal", "n_benign", "fp_normal", "fp_benign")
+
 RUN_COLUMNS = (
-    "level", "model", "seed", "degradation", "severity",
+    "level", "subset", "model", "seed", "degradation", "severity",
     "threshold", "threshold_source",
     "n_patients", "n_units", "n_positive", "n_negative", "tp", "fp", "tn", "fn",
+    *CLASS_COUNT_COLUMNS,
     *[f"{prefix}{metric}{suffix}"
       for metric in METRICS
       for prefix in ("", "delta_")
@@ -39,7 +59,7 @@ RUN_COLUMNS = (
     "n_bootstrap", "confidence",
 )
 SUMMARY_COLUMNS = (
-    "level", "model", "degradation", "severity", "n_seeds", "threshold_source",
+    "level", "subset", "model", "degradation", "severity", "n_seeds", "threshold_source",
     *[f"{prefix}{metric}_{stat}"
       for metric in METRICS
       for prefix in ("", "delta_")
@@ -60,22 +80,29 @@ def _fail(mask: pd.Series, message: str) -> None:
 
 
 def validate_predictions(frame: pd.DataFrame, level: str) -> pd.DataFrame:
-    """Check an agreed-format table and return it with typed label/score/seed.
+    """Check an agreed-format table and return it with typed columns.
 
-    Every model/seed run must contain a clean baseline, and every condition in
-    that run must cover exactly the same evaluation units as the baseline so
+    The agreed columns are required; ``view_status``, ``original_class`` and
+    ``label_flag`` are optional and may appear in any position. Every
+    model/seed run must contain a clean baseline, and every condition in that
+    run must cover exactly the same evaluation units as the baseline so
     degraded results can be compared with clean results on identical cases.
     """
     if level not in UNIT_COLUMNS:
         raise ValueError(f"level must be one of {sorted(UNIT_COLUMNS)}")
-    expected = IMAGE_COLUMNS if level == "image" else BREAST_COLUMNS
-    if tuple(frame.columns) != expected:
-        raise ValueError(f"{level}-level columns must be exactly {','.join(expected)}")
+    required = IMAGE_COLUMNS if level == "image" else BREAST_COLUMNS
+    missing = [c for c in required if c not in frame.columns]
+    unexpected = [c for c in frame.columns if c not in required and c not in OPTIONAL_COLUMNS]
+    if missing or unexpected:
+        raise ValueError(
+            f"{level}-level columns must be {','.join(required)}, optionally with "
+            f"{','.join(OPTIONAL_COLUMNS)} (missing: {missing}, unexpected: {unexpected})")
     if frame.empty:
         raise ValueError("No predictions supplied")
     df = frame.astype(str).reset_index(drop=True)
+    optional = [c for c in OPTIONAL_COLUMNS if c in df.columns]
 
-    for name in set(expected) - {"label", "score", "seed"}:
+    for name in [c for c in df.columns if c not in ("label", "score", "seed")]:
         values = df[name]
         _fail((values == "") | (values != values.str.strip()), f"{name} must be a non-empty trimmed string")
     _fail(~df["breast_side"].isin(["L", "R"]), "breast_side must be L or R")
@@ -93,9 +120,27 @@ def validate_predictions(frame: pd.DataFrame, level: str) -> pd.DataFrame:
     df["score"] = scores
     df["seed"] = df["seed"].astype(int)
 
+    if VIEW_STATUS in df:
+        df[VIEW_STATUS] = df[VIEW_STATUS].str.lower().replace(VIEW_STATUS_ALIASES)
+        _fail(~df[VIEW_STATUS].isin(VIEW_COUNTS), "view_status must be single(_view) or paired(_view)")
+    if ORIGINAL_CLASS in df:
+        df[ORIGINAL_CLASS] = df[ORIGINAL_CLASS].str.lower()
+        _fail(~df[ORIGINAL_CLASS].isin(ORIGINAL_CLASSES), "original_class must be normal, benign or malignant")
+        _fail((df[ORIGINAL_CLASS] == "malignant") != (df["label"] == 1),
+              "label must be 1 exactly when original_class is malignant")
+    if LABEL_FLAG in df:
+        flags = df[LABEL_FLAG].str.lower()
+        _fail(~flags.isin(FLAG_VALUES), "label_flag must be 0/1 or true/false")
+        df[LABEL_FLAG] = flags.map(FLAG_VALUES).astype(int)
+
     units = list(UNIT_COLUMNS[level])
     _fail(df.duplicated(units + ["model", "seed", "degradation", "severity"]), "Duplicate prediction")
-    _fail(df.groupby(units)["label"].transform("nunique") > 1, "Conflicting labels for one evaluation unit")
+    for name in ["label", *optional]:
+        _fail(df.groupby(units)[name].transform("nunique") > 1, f"Conflicting {name} for one evaluation unit")
+    if level == "image" and VIEW_STATUS in df:
+        n_views = df.groupby(["patient_id", "breast_side", "model", "seed", "degradation", "severity"])["view"]
+        _fail(n_views.transform("size") != df[VIEW_STATUS].map(VIEW_COUNTS),
+              "view_status does not match the number of views for this breast")
 
     for (model, seed), run in df.groupby(["model", "seed"], sort=True):
         coverage = {
@@ -112,17 +157,59 @@ def validate_predictions(frame: pd.DataFrame, level: str) -> pd.DataFrame:
     return df
 
 
-def load_predictions(path: str | Path) -> tuple[pd.DataFrame, str]:
-    """Read an image- or breast-level CSV; the level is detected from its header."""
+def attach_metadata(frame: pd.DataFrame, metadata: pd.DataFrame, level: str) -> pd.DataFrame:
+    """Add optional columns from a separate metadata CSV to a raw prediction table.
+
+    Rows are matched on the evaluation unit plus model, seed and condition.
+    Both tables must cover exactly the same rows, and a ``label`` column in
+    the metadata must agree with the predictions. Other metadata columns
+    (for example ``image_id`` or ``score``) are ignored.
+    """
+    keys = [*UNIT_COLUMNS[level], "model", "seed", "degradation", "severity"]
+    metadata = metadata.rename(columns=METADATA_ALIASES)
+    missing = [k for k in keys if k not in metadata.columns]
+    if missing:
+        raise ValueError(f"metadata is missing join columns {missing}")
+    fields = [c for c in OPTIONAL_COLUMNS if c in metadata.columns]
+    if not fields:
+        raise ValueError(f"metadata has none of {', '.join([*OPTIONAL_COLUMNS, *METADATA_ALIASES])}")
+    clash = [c for c in fields if c in frame.columns]
+    if clash:
+        raise ValueError(f"{clash} appear in both the predictions and the metadata")
+    checks = ["label"] if "label" in metadata.columns else []
+    meta = metadata[keys + checks + fields]
+    if meta.duplicated(keys).any():
+        raise ValueError(f"metadata has more than one row for {dict(meta[meta.duplicated(keys)].iloc[0][keys])}")
+
+    merged = frame.merge(meta, on=keys, how="left", suffixes=("", "_metadata"), indicator=True)
+    unmatched = merged[merged["_merge"] != "both"]
+    if not unmatched.empty:
+        raise ValueError(f"no metadata row for prediction {dict(unmatched.iloc[0][keys])}")
+    extra = meta.merge(frame[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+    extra = extra[extra["_merge"] != "both"]
+    if not extra.empty:
+        raise ValueError(f"metadata row has no matching prediction: {dict(extra.iloc[0][keys])}")
+    if checks:
+        differs = merged["label"] != merged["label_metadata"]
+        if differs.any():
+            raise ValueError(f"metadata label disagrees with predictions for {dict(merged[differs].iloc[0][keys])}")
+    return merged[[*frame.columns, *fields]]
+
+
+def load_predictions(path: str | Path, metadata: str | Path | None = None) -> tuple[pd.DataFrame, str]:
+    """Read an image- or breast-level CSV, optionally joined with its metadata CSV.
+
+    The level is detected from the prediction header.
+    """
     frame = pd.read_csv(path, dtype=str, keep_default_na=False)
-    header = tuple(frame.columns)
-    if header == IMAGE_COLUMNS:
-        level = "image"
-    elif header == BREAST_COLUMNS:
-        level = "breast"
-    else:
-        raise ValueError(f"{path}: header matches neither agreed prediction format")
-    return validate_predictions(frame, level), level
+    level = "image" if {"case_id", "view"} & set(frame.columns) else "breast"
+    try:
+        if metadata is not None:
+            frame = attach_metadata(frame, pd.read_csv(metadata, dtype=str, keep_default_na=False), level)
+        return validate_predictions(frame, level), level
+    except ValueError as error:
+        source = f"{path} + {metadata}" if metadata is not None else f"{path}"
+        raise ValueError(f"{source}: {error}") from None
 
 
 # --------------------------------------------------------------------------
@@ -247,24 +334,28 @@ def _percentile_ci(samples: np.ndarray, confidence: float) -> tuple[np.ndarray, 
     return low, high
 
 
-def _run_rng(bootstrap_seed: int, model: str, seed: int) -> np.random.Generator:
+def _subset_rng(bootstrap_seed: int, model: str, seed: int, subset: str) -> np.random.Generator:
     # Independent of which other runs are in the file, so adding a model does
     # not change the intervals already reported for another model.
-    return np.random.default_rng([bootstrap_seed, int(seed), zlib.crc32(model.encode("utf-8"))])
+    return np.random.default_rng([bootstrap_seed, int(seed),
+                                  zlib.crc32(model.encode("utf-8")), zlib.crc32(subset.encode("utf-8"))])
 
 
-def _evaluate_run(run: pd.DataFrame, level: str, model: str, seed: int, threshold: float,
-                  source: str, n_bootstrap: int, confidence: float, bootstrap_seed: int) -> list[dict]:
-    units = list(UNIT_COLUMNS[level])
-    conditions = sorted(run.groupby(["degradation", "severity"]).groups, key=_condition_order)
-    by_condition = {cond: g.set_index(units).sort_index()
-                    for cond, g in run.groupby(["degradation", "severity"])}
-    reference = by_condition[CLEAN]
-    labels = reference["label"].to_numpy()
-    scores = np.vstack([by_condition[c]["score"].reindex(reference.index).to_numpy() for c in conditions])
+def _subsets(reference: pd.DataFrame) -> list[tuple[str, np.ndarray]]:
+    """All units, then view-status groups and unflagged units when those columns exist."""
+    masks = [("all", np.ones(len(reference), dtype=bool))]
+    if VIEW_STATUS in reference:
+        masks += [(status, (reference[VIEW_STATUS] == status).to_numpy()) for status in ("paired_view", "single_view")]
+    if LABEL_FLAG in reference:
+        masks.append(("unflagged", (reference[LABEL_FLAG] == 0).to_numpy()))
+    return [(name, mask) for name, mask in masks if mask.any()]
+
+
+def _evaluate_units(labels: np.ndarray, scores: np.ndarray, patients: np.ndarray, classes: np.ndarray | None,
+                    conditions: list[tuple[str, str]], threshold: float, n_bootstrap: int,
+                    confidence: float, rng: np.random.Generator, base: dict) -> list[dict]:
+    """Metric rows for one set of units; ``scores`` has one row per condition."""
     clean_index = conditions.index(CLEAN)
-
-    patients = reference.index.get_level_values("patient_id").to_numpy()
     patient_ids, patient_codes = np.unique(patients, return_inverse=True)
     rows_of_patient = [np.flatnonzero(patient_codes == p) for p in range(patient_ids.size)]
 
@@ -279,7 +370,6 @@ def _evaluate_run(run: pd.DataFrame, level: str, model: str, seed: int, threshol
     if n_bootstrap > 0:
         # Resample patients, not breasts or images, and reuse each resample for
         # every condition so the delta intervals are paired.
-        rng = _run_rng(bootstrap_seed, model, seed)
         samples = np.empty((n_bootstrap, len(conditions), len(METRICS)))
         for b in range(n_bootstrap):
             chosen = rng.integers(0, patient_ids.size, patient_ids.size)
@@ -289,15 +379,18 @@ def _evaluate_run(run: pd.DataFrame, level: str, model: str, seed: int, threshol
 
     records = []
     for c, (degradation, severity) in enumerate(conditions):
-        counts = confusion_counts(labels, scores[c], threshold)
         record = {
-            "level": level, "model": model, "seed": seed,
-            "degradation": degradation, "severity": severity,
-            "threshold": threshold, "threshold_source": source,
+            **base, "degradation": degradation, "severity": severity,
             "n_patients": int(patient_ids.size), "n_units": int(labels.size),
             "n_positive": int(labels.sum()), "n_negative": int(labels.size - labels.sum()),
-            **counts, "n_bootstrap": n_bootstrap, "confidence": confidence,
+            **confusion_counts(labels, scores[c], threshold),
         }
+        if classes is not None:
+            # Where the false positives come from: normal or benign units.
+            predicted = scores[c] >= threshold
+            for name in ("normal", "benign"):
+                record[f"n_{name}"] = int((classes == name).sum())
+                record[f"fp_{name}"] = int((predicted & (classes == name)).sum())
         for m, metric in enumerate(METRICS):
             record[metric] = point[c, m]
             record[f"delta_{metric}"] = point_delta[c, m]
@@ -308,12 +401,40 @@ def _evaluate_run(run: pd.DataFrame, level: str, model: str, seed: int, threshol
     return records
 
 
+def _evaluate_run(run: pd.DataFrame, level: str, model: str, seed: int, threshold: float,
+                  source: str, n_bootstrap: int, confidence: float, bootstrap_seed: int) -> list[dict]:
+    units = list(UNIT_COLUMNS[level])
+    conditions = sorted(run.groupby(["degradation", "severity"]).groups, key=_condition_order)
+    by_condition = {cond: g.set_index(units).sort_index()
+                    for cond, g in run.groupby(["degradation", "severity"])}
+    reference = by_condition[CLEAN]
+    labels = reference["label"].to_numpy()
+    scores = np.vstack([by_condition[c]["score"].reindex(reference.index).to_numpy() for c in conditions])
+    patients = reference.index.get_level_values("patient_id").to_numpy()
+    classes = reference[ORIGINAL_CLASS].to_numpy() if ORIGINAL_CLASS in reference else None
+
+    records = []
+    for subset, mask in _subsets(reference):
+        keep = np.flatnonzero(mask)
+        base = {
+            "level": level, "subset": subset, "model": model, "seed": seed,
+            "threshold": threshold, "threshold_source": source,
+            "n_bootstrap": n_bootstrap, "confidence": confidence,
+        }
+        records += _evaluate_units(
+            labels[keep], scores[:, keep], patients[keep], None if classes is None else classes[keep],
+            conditions, threshold, n_bootstrap, confidence,
+            _subset_rng(bootstrap_seed, model, seed, subset), base)
+    return records
+
+
 def evaluate_predictions(predictions: pd.DataFrame, level: str, thresholds: Thresholds, *,
                          n_bootstrap: int = 2000, confidence: float = 0.95,
                          bootstrap_seed: int = 0) -> pd.DataFrame:
-    """One row per model, seed and condition, with deltas from that run's clean baseline.
+    """One row per subset, model, seed and condition, with deltas from that run's clean baseline.
 
-    ``predictions`` must already be validated (see ``load_predictions``).
+    ``predictions`` must already be validated (see ``load_predictions``). The
+    same per-run threshold is used for every subset and condition.
     """
     if n_bootstrap < 0:
         raise ValueError("n_bootstrap must be nonnegative")
@@ -326,16 +447,23 @@ def evaluate_predictions(predictions: pd.DataFrame, level: str, thresholds: Thre
         threshold, source = thresholds[(model, seed)]
         records += _evaluate_run(run, level, model, int(seed), float(threshold), source,
                                  n_bootstrap, confidence, bootstrap_seed)
-    return pd.DataFrame.from_records(records, columns=RUN_COLUMNS)
+    result = pd.DataFrame.from_records(records, columns=RUN_COLUMNS)
+    result["_subset"] = result["subset"].map(SUBSETS.index)
+    result = (result.sort_values(["_subset", "model", "seed"], kind="stable")
+              .drop(columns="_subset").reset_index(drop=True))
+    for column in CLASS_COUNT_COLUMNS:
+        result[column] = result[column].astype("Int64")
+    return result
 
 
 def summarize_over_seeds(per_run: pd.DataFrame) -> pd.DataFrame:
     """Mean and sample SD (NaN for a single seed) of each metric across training seeds."""
-    keys = ["level", "model", "degradation", "severity"]
+    keys = ["level", "subset", "model", "degradation", "severity"]
     records = []
-    for (level, model, degradation, severity), group in per_run.groupby(keys, sort=False):
+    for (level, subset, model, degradation, severity), group in per_run.groupby(keys, sort=False):
         record = {
-            "level": level, "model": model, "degradation": degradation, "severity": severity,
+            "level": level, "subset": subset, "model": model,
+            "degradation": degradation, "severity": severity,
             "n_seeds": int(group["seed"].nunique()),
             "threshold_source": ";".join(sorted(group["threshold_source"].unique())),
         }
@@ -350,6 +478,32 @@ def summarize_over_seeds(per_run: pd.DataFrame) -> pd.DataFrame:
 
 # --------------------------------------------------------------------------
 # Command line
+
+
+def _file_record(path: str | Path) -> dict:
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return {"path": str(path), "sha256": digest}
+
+
+def evaluation_metadata(args: argparse.Namespace, level: str, thresholds: Thresholds) -> dict:
+    """Which inputs, thresholds and settings produced a set of metric files."""
+    return {
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "level": level,
+        "predictions": _file_record(args.predictions),
+        "metadata": _file_record(args.metadata) if args.metadata else None,
+        "validation": _file_record(args.validation) if args.validation else None,
+        "threshold_rule": args.threshold if isinstance(args.threshold, str) else "fixed",
+        "thresholds": [
+            {"model": model, "seed": int(seed), "threshold": value, "source": source}
+            for (model, seed), (value, source) in sorted(thresholds.items())
+        ],
+        "clean_only": args.clean_only,
+        "n_bootstrap": args.bootstrap,
+        "confidence": args.confidence,
+        "bootstrap_seed": args.bootstrap_seed,
+        "versions": {"python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__},
+    }
 
 
 def _parse_threshold(text: str) -> float | str:
@@ -368,7 +522,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("predictions", help="test-set image- or breast-level prediction CSV")
     parser.add_argument("--threshold", type=_parse_threshold, default=0.5,
                         help="fixed threshold (default 0.5) or 'youden' to select it on --validation")
+    parser.add_argument("--metadata",
+                        help="metadata CSV for the predictions (view_status, original_class, "
+                             "view_label_conflict), joined on breast/image, model, seed and condition")
     parser.add_argument("--validation", help="validation-set CSV at the same level, required for 'youden'")
+    parser.add_argument("--clean-only", action="store_true",
+                        help="evaluate only the clean baseline rows of the predictions CSV")
     parser.add_argument("--bootstrap", type=int, default=2000,
                         help="patient-level bootstrap resamples per run; 0 disables CIs (default 2000)")
     parser.add_argument("--confidence", type=float, default=0.95, help="CI level (default 0.95)")
@@ -376,7 +535,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out-dir", default="outputs/metrics", help="output directory (default outputs/metrics)")
     args = parser.parse_args(argv)
 
-    predictions, level = load_predictions(args.predictions)
+    predictions, level = load_predictions(args.predictions, args.metadata)
+    if args.clean_only:
+        predictions = predictions[predictions["degradation"] == "clean"].reset_index(drop=True)
     if isinstance(args.threshold, str):
         if not args.validation:
             parser.error(f"--threshold {args.threshold} requires --validation")
@@ -396,6 +557,8 @@ def main(argv: list[str] | None = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     per_run.to_csv(out_dir / f"{level}_metrics_by_run.csv", index=False, lineterminator="\n")
     summary.to_csv(out_dir / f"{level}_metrics_summary.csv", index=False, lineterminator="\n")
+    (out_dir / f"{level}_evaluation_metadata.json").write_text(
+        json.dumps(evaluation_metadata(args, level, thresholds), indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {len(per_run)} run rows and {len(summary)} summary rows to {out_dir}")
 
 
