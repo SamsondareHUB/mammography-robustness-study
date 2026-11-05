@@ -10,7 +10,10 @@ import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .training_data import index_images, read_manifest, read_patient_splits, validate_records
+from .training_data import (
+    index_images, read_manifest, read_patient_splits,
+    select_evaluation_images, validate_records,
+)
 
 
 @dataclass(frozen=True)
@@ -96,7 +99,8 @@ def run_training(records, image_paths, cfg: TrainingConfig, manifest_path: Path,
 
     class MammogramDataset(Dataset):
         def __init__(self, split):
-            self.rows = [row for row in records if row.split == split]
+            eligible = [row for row in records if row.split == split]
+            self.rows = select_evaluation_images(eligible) if split == "val" else eligible
             if not self.rows:
                 raise ValueError(f"No records for {split}")
 

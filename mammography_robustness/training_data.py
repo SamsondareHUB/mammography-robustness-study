@@ -14,6 +14,14 @@ SPLITS = ("train", "val", "test")
 VIEWS = frozenset({"CC", "MLO"})
 SIDES = frozenset({"L", "R"})
 
+# Pre-specified, score-independent acquisition choices approved for CDD-CESM.
+# These are distinct source images, not duplicate files. Patient 99 is train;
+# patient 281 is validation. Neither belongs to the test set.
+EXTRA_MLO_ACQUISITIONS = {
+    ("99", "L", "MLO"): ("train", "P99_L_DM_MLO", "P99_L_DM_MLO_2"),
+    ("281", "L", "MLO"): ("val", "P281_L_DM_MLO", "P281_L_DM_MLO2"),
+}
+
 
 @dataclass(frozen=True)
 class ImageRecord:
@@ -123,12 +131,20 @@ def validate_records(records: list[ImageRecord], splits: dict[str, set[str]]) ->
     incomplete = 0
     label_conflicts = 0
     for (patient, side), breast_rows in breasts.items():
-        views = [row.view for row in breast_rows]
-        if len(views) != len(set(views)):
-            raise ValueError(f"Duplicate view for patient {patient}, breast {side}")
+        by_view: dict[str, list[ImageRecord]] = defaultdict(list)
+        for row in breast_rows:
+            by_view[row.view].append(row)
+        for view, rows in by_view.items():
+            if len(rows) > 1:
+                approved = EXTRA_MLO_ACQUISITIONS.get((patient, side, view))
+                observed = {r.case_id for r in rows}
+                if (approved is None or len(rows) != 2 or
+                        observed != set(approved[1:]) or
+                        any(r.split != approved[0] or r.label != 0 for r in rows)):
+                    raise ValueError(f"Duplicate view for patient {patient}, breast {side}")
         if len({row.label for row in breast_rows}) != 1:
             label_conflicts += 1
-        if set(views) != VIEWS:
+        if set(by_view) != VIEWS:
             incomplete += 1
 
     return DataSummary(
@@ -138,6 +154,23 @@ def validate_records(records: list[ImageRecord], splits: dict[str, set[str]]) ->
         incomplete_breasts=incomplete,
         conflicting_label_breasts=label_conflicts,
     )
+
+
+def select_evaluation_images(records: list[ImageRecord]) -> list[ImageRecord]:
+    """Select the approved unsuffixed MLO without changing source annotations.
+
+    Use for validation loss, validation predictions and test predictions.
+    Train on all training images, including both patient 99 acquisitions.
+    """
+    present = {(r.patient_id, r.breast_side, r.view): set() for r in records}
+    for row in records:
+        present[(row.patient_id, row.breast_side, row.view)].add(row.case_id)
+    for key, (_, selected, extra) in EXTRA_MLO_ACQUISITIONS.items():
+        ids = present.get(key, set())
+        if extra in ids and selected not in ids:
+            raise ValueError(f"Missing selected evaluation acquisition: {selected}")
+    excluded = {extra for _, _, extra in EXTRA_MLO_ACQUISITIONS.values()}
+    return [row for row in records if row.case_id not in excluded]
 
 
 def index_images(root: str | Path, records: list[ImageRecord]) -> dict[str, Path]:
