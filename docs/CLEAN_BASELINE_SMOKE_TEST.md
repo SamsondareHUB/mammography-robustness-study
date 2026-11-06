@@ -124,6 +124,17 @@ def verify(run_dir):
     files = {name: read_csv(run_dir / name) for name in counts}
     for name, count in counts.items():
         check(len(files[name]) == count, f'{name}: expected {count} rows, got {len(files[name])}')
+    for name, rows in files.items():
+        for line_number, row in enumerate(rows, start=2):
+            check(row.get('degradation') == 'clean' and row.get('severity') == 'none',
+                  f'{name}:{line_number}: expected clean/none condition')
+            if 'score' in row:
+                try:
+                    score = float(row['score'])
+                except (TypeError, ValueError):
+                    check(False, f'{name}:{line_number}: invalid probability')
+                check(math.isfinite(score) and 0 <= score <= 1,
+                      f'{name}:{line_number}: probability outside [0, 1]')
     pairs = {(r.get('model'), r.get('seed')) for rows in files.values() for r in rows}
     check(len(pairs) == 1 and all(all(p) for p in pairs), f'multiple/missing model-seed values: {run_dir}')
     for split in ('val', 'test'):
