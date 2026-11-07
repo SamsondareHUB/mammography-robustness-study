@@ -17,10 +17,26 @@ This log distinguishes approved study rules from choices currently implemented i
 - Normal and benign map to non-malignant (0); malignant maps to positive (1). Preserve original `normal`, `benign`, and `malignant` annotations in analysis metadata rather than reconstructing them from binary labels.
 - Breast-level ground truth takes the more severe view diagnosis. Source image labels remain unchanged, including Patient 16's reviewed CC/MLO disagreement.
 
-## Decision 4: Models
-- Status: Two candidate architectures implemented; experiment settings not yet finalized.
-- MobileNetV3-Small and ResNet-18 use two-logit classification heads. Both are randomly initialized in the current training code; the configuration contains example settings.
-- Three seeds per model are planned. Final model choices, training settings, seeds, and any use of pretrained weights need group agreement.
+## Decision 4: Models and baseline training
+
+- Status: Initial training protocol approved by Sammie on November 7, 2026. Implementation pending.
+- Architectures: MobileNetV3-Small and ResNet-18, each with a newly initialized two-class classification head.
+- Initialization: ImageNet-pretrained feature weights for both architectures. Record the exact torchvision weight identifiers and software versions. Proposed explicit identifiers: `MobileNet_V3_Small_Weights.IMAGENET1K_V1` and `ResNet18_Weights.IMAGENET1K_V1`.
+- Training seeds: 42, 43, and 44. Train MobileNetV3-Small seed 42 first and complete its smoke test before training the remaining checkpoints.
+- Input: 224 x 224 RGB images, preserving aspect ratio through padding.
+- Normalization: ImageNet channel means (0.485, 0.456, 0.406) and standard deviations (0.229, 0.224, 0.225), consistently applied during training and inference.
+- Augmentation: Horizontal flips and small rotations on training images only. No random augmentation on validation or test images.
+- Initial augmentation parameters: horizontal-flip probability 0.5 and rotation range -10 to +10 degrees. These numerical values are implementation choices within the approved augmentation types.
+- Optimizer: AdamW, learning rate 0.0001, weight decay 0.0001.
+- Batch size: 16.
+- Maximum epochs: 30.
+- Loss: Class-weighted cross-entropy, with weights derived from training-split class counts only.
+- Validation: Use the approved evaluation-image selection and aggregate image malignancy probabilities by maximum score across available views for each breast.
+- Checkpoint selection: Highest breast-level validation ROC AUC. Break ties using lower validation loss, then earlier epoch.
+- Early stopping: Patience of five epochs without improvement in breast-level validation AUC.
+- Artifacts: Save the best checkpoint, training history, final configuration, and validation predictions for each seed outside the public repository.
+- Pre-training requirement: Implement and test the approved protocol, then complete the first MobileNetV3-Small seed-42 training run.
+- Experiment sequence: Perform the two-run clean-inference smoke test before seeking approval for the remaining five checkpoints.
 
 ## Decision 5: Image-quality variations
 - Status: Proposed.

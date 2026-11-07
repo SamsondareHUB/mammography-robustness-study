@@ -9,11 +9,12 @@ import os
 import tempfile
 from pathlib import Path
 
+from .preprocessing import make_transform
 from .predictions import (
     ImagePrediction, export_prediction_tables, write_breast_metadata_csv,
     write_image_metadata_csv,
 )
-from .training import create_model
+from .training import WEIGHT_IDS, create_model
 from .training_data import (
     index_images, read_manifest, read_patient_splits,
     select_evaluation_images, validate_records,
@@ -93,17 +94,25 @@ def _load_checkpoint(path: Path, manifest_hash: str, splits_hash: str):
     size, batch = config.get("image_size"), config.get("batch_size")
     if type(size) is not int or size < 64 or type(batch) is not int or batch < 1:
         raise ValueError(f"Invalid preprocessing configuration in {path}")
+    if config.get("normalization", "none") not in ("none", "imagenet"):
+        raise ValueError("Checkpoint has an unsupported normalization configuration")
+    if config.get("pretrained", False):
+        if config.get("normalization") != "imagenet" or not checkpoint.get("pretrained_weights"):
+            raise ValueError("Pretrained checkpoint is missing preprocessing or weight provenance")
+        if checkpoint["pretrained_weights"] != WEIGHT_IDS[name]:
+            raise ValueError("Pretrained checkpoint weight provenance does not match model")
     if not isinstance(checkpoint.get("model_state_dict"), dict):
         raise ValueError(f"Missing model state in {path}")
     return checkpoint, name, seed, size, batch
 
 
-def predict_images(model, records, image_paths, image_size: int, batch_size: int, device):
-    """Return malignancy probabilities using the training image preprocessing."""
+def predict_images(model, records, image_paths, image_size: int, batch_size: int, device, *, normalization: str = "none"):
+    """Return probabilities using the checkpoint's recorded image normalization."""
     import torch
-    from PIL import Image, ImageOps
+    from PIL import Image
     from torch.utils.data import DataLoader, Dataset
-    from torchvision.transforms import ToTensor
+
+    transform = make_transform(image_size, training=False, normalization=normalization)
 
     class ImageDataset(Dataset):
         def __len__(self):
@@ -112,12 +121,7 @@ def predict_images(model, records, image_paths, image_size: int, batch_size: int
         def __getitem__(self, index):
             row = records[index]
             with Image.open(image_paths[row.case_id]) as opened:
-                rgb = opened.convert("RGB")
-                resized = ImageOps.pad(
-                    rgb, (image_size, image_size), method=Image.Resampling.BILINEAR,
-                    color=(0, 0, 0),
-                )
-                return ToTensor()(resized)
+                return transform(opened)
 
     model.eval()
     loader = DataLoader(ImageDataset(), batch_size=batch_size, shuffle=False, num_workers=0)
@@ -175,8 +179,12 @@ def export_clean_predictions(
         model = create_model(model_name)
         model.load_state_dict(state["model_state_dict"], strict=True)
         model.to(device)
+        normalization = state["config"].get("normalization", "none")
         for split, rows in by_split.items():
-            scores = predict_images(model, rows, image_paths, image_size, batch_size, device)
+            scores = predict_images(
+                model, rows, image_paths, image_size, batch_size, device,
+                normalization=normalization,
+            )
             predictions[split].extend(
                 ImagePrediction(
                     case_id=row.case_id, patient_id=row.patient_id,
