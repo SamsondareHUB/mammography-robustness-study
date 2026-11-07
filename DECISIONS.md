@@ -1,59 +1,51 @@
 # Project Decisions
 
-Record each agreed project decision here. Update this file when the group reaches a decision.
+This log distinguishes approved study rules from choices currently implemented in the baseline code.
 
 ## Decision 1: Dataset
-- Status: Proposed
-- Proposed choice: CBIS-DDSM as the primary dataset
-- Group decision:
-- Date:
-- Notes:
+- Status: CDD-CESM low-energy baseline prepared; final study dataset not yet confirmed.
+- The repository contains a CDD-CESM image manifest and patient-level splits. CBIS-DDSM was the original proposal.
+- Pending: Confirm dataset selection, provenance, access, and permitted use.
 
 ## Decision 2: Prediction task
-- Status: To be agreed
-- Options to discuss: image-level, lesion-level, or case-level classification
-- Final choice:
-- Date:
-- Notes:
+- Status: Clean-baseline pipeline implemented.
+- Binary malignancy classification uses image-level training and breast-level evaluation. Breast scores are the maximum of available CC and MLO scores, including single-view breasts.
+- The study-wide task definition remains subject to group confirmation.
 
 ## Decision 3: Classes and labels
-- Status: To be agreed
-- Proposed task: malignant versus non-malignant
-- Final choice:
-- Date:
-- Notes:
+- Status: Binary-label handling implemented; verified original-class annotations needed for real-data inference.
+- Normal and benign map to non-malignant (0); malignant maps to positive (1). Preserve original `normal`, `benign`, and `malignant` annotations in analysis metadata rather than reconstructing them from binary labels.
+- Breast-level ground truth takes the more severe view diagnosis. Source image labels remain unchanged, including Patient 16's reviewed CC/MLO disagreement.
 
 ## Decision 4: Models
-- Status: To be agreed
-- Candidate models:
-- Final choice:
-- Date:
-- Notes:
+- Status: Two candidate architectures implemented; experiment settings not yet finalized.
+- MobileNetV3-Small and ResNet-18 use two-logit classification heads. Both are randomly initialized in the current training code; the configuration contains example settings.
+- Three seeds per model are planned. Final model choices, training settings, seeds, and any use of pretrained weights need group agreement.
 
 ## Decision 5: Image-quality variations
-- Status: Proposed
-- Candidate variations: noise, blur, reduced contrast, and lower resolution
-- Final choice and severity levels:
-- Date:
-- Notes:
+- Status: Proposed.
+- Candidates: Noise, blur, reduced contrast, and lower resolution.
+- Pending: Agree on transformations, parameter ranges, and severity levels before running degradation experiments.
 
 ## Decision 6: Data split
-- Status: To be agreed
-- Requirement: split by patient or case to reduce data leakage
-- Final split:
-- Date:
-- Notes:
+- Status: Patient-disjoint split implemented for the CDD-CESM baseline.
+- The manifest assigns 228 patients to training, 49 to validation, and 49 to test.
+- The evaluation-image selection in Decision 9 does not alter source split assignments.
 
 ## Decision 7: Evaluation metrics
-- Status: Proposed
-- Candidate metrics: AUC, sensitivity, specificity, and F1-score
-- Final choice:
-- Date:
-- Notes:
+- Status: Evaluation code implemented; final reporting protocol pending.
+- Breast-level metrics: ROC AUC, sensitivity, specificity, and F1-score. The evaluator supports patient-level bootstrap confidence intervals and summaries across seeds.
+- Youden's J thresholds can be selected from clean validation predictions per model/seed, then applied unchanged to the corresponding test conditions.
 
 ## Decision 8: Data and code sharing
-- Status: To be agreed
-- Dataset terms checked:
-- Data will not be uploaded unless sharing is permitted.
-- Date:
-- Notes:
+- Status: Dataset usage and redistribution terms not yet verified.
+- The repository contains code and metadata, not the mammogram files or trained checkpoints. Keep images, checkpoints, and restricted data-derived outputs out of the public repository unless sharing is permitted.
+
+## Decision 9: Repeated MLO acquisitions
+- Status: Approved by the project lead on November 2, 2026; reaffirmed in the November 5 review of PR #7.
+- The repeated MLO acquisitions are treated as likely re-takes, not confirmed duplicates. Their acquisition history is unverified.
+- Use the unsuffixed MLO image for evaluation for Patients 99 and 281. This selection was fixed before evaluation and does not depend on model scores.
+- Patient 99 (training): Retain both `P99_L_DM_MLO` and `P99_L_DM_MLO_2` for training. Select `P99_L_DM_MLO` when an evaluation view is needed.
+- Patient 281 (validation): Use `P281_L_DM_MLO` for validation loss and prediction exports. Keep `P281_L_DM_MLO2` and its annotation in the source manifest but exclude that image from those calculations and exports.
+- Apply the same selection across models, seeds, and image-quality conditions. No test images are excluded. Single-view and Patient 16 label-conflict handling remain unchanged.
+- References: [Acquisition policy](docs/ACQUISITION_POLICY.md) and [PR #7](https://github.com/SamsondareHUB/mammography-robustness-study/pull/7).
