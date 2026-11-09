@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import random
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -111,6 +112,27 @@ def create_model(name: str, *, pretrained: bool = False):
     return model
 
 
+def _git_provenance() -> tuple[str, bool]:
+    """Record the exact Git revision and whether the checkout has local changes."""
+    repository = Path(__file__).resolve().parent.parent
+
+    def git_output(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repository), *args],
+                check=True, capture_output=True, text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError("Cannot determine training source Git provenance") from exc
+        return result.stdout.strip()
+
+    revision = git_output("rev-parse", "--verify", "HEAD")
+    if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+        raise RuntimeError("Invalid training source Git commit")
+    dirty = bool(git_output("status", "--porcelain", "--untracked-files=normal"))
+    return revision, dirty
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -164,6 +186,7 @@ def _validation_predictions(rows, probabilities, cfg):
 
 def run_training(records, image_paths, cfg: TrainingConfig, manifest_path: Path, splits_path: Path):
     """Train one approved model/seed; never access test images for selection."""
+    import PIL
     import torch
     import torchvision
     from PIL import Image
@@ -221,6 +244,7 @@ def run_training(records, image_paths, cfg: TrainingConfig, manifest_path: Path,
     # Guard every run artifact before downloading weights or starting training.
     if any(p.exists() for p in (path, history_path, config_path, *prediction_paths)):
         raise FileExistsError(f"Training output already exists for {stem}; use a fresh output directory")
+    git_commit, git_dirty = _git_provenance()
     output.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -277,6 +301,8 @@ def run_training(records, image_paths, cfg: TrainingConfig, manifest_path: Path,
                 "training_class_weights": loss_weights if cfg.class_weighted else None,
                 "manifest_sha256": manifest_sha, "splits_sha256": splits_sha,
                 "pretrained_weights": WEIGHT_IDS[cfg.model] if cfg.pretrained else None,
+                "git_commit": git_commit, "git_dirty": git_dirty,
+                "python_version": sys.version, "pillow_version": PIL.__version__,
                 "torch_version": str(torch.__version__),
                 "torchvision_version": str(torchvision.__version__),
             }
@@ -294,6 +320,8 @@ def run_training(records, image_paths, cfg: TrainingConfig, manifest_path: Path,
     config_path.write_text(json.dumps({
         **asdict(cfg), "torch_version": str(torch.__version__),
         "torchvision_version": str(torchvision.__version__), "python_version": sys.version,
+        "pillow_version": PIL.__version__,
+        "git_commit": git_commit, "git_dirty": git_dirty,
         "pretrained_weights": WEIGHT_IDS[cfg.model] if cfg.pretrained else None,
         "manifest_sha256": manifest_sha, "splits_sha256": splits_sha,
         "training_class_weights": loss_weights if cfg.class_weighted else None,
