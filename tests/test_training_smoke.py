@@ -2,6 +2,8 @@
 
 import csv
 import hashlib
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,6 +74,20 @@ class TrainingSmokeTests(unittest.TestCase):
         self.assertEqual(ckpt["pretrained_weights"], "MobileNet_V3_Small_Weights.IMAGENET1K_V1")
         self.assertEqual(ckpt["config"]["normalization"], "imagenet")
         self.assertEqual(ckpt["epoch"], 1)
+        self.assertRegex(ckpt["git_commit"], r"^[0-9a-f]{40}$")
+        self.assertEqual(
+            ckpt["git_commit"], subprocess.check_output(
+                ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+                text=True,
+            ).strip(),
+        )
+        self.assertIsInstance(ckpt["git_dirty"], bool)
+        self.assertIn("python_version", ckpt)
+        self.assertIn("pillow_version", ckpt)
+        with (out / f"{stem}_config.json").open(encoding="utf-8") as stream:
+            saved = json.load(stream)
+        for name in ("git_commit", "git_dirty", "python_version", "pillow_version"):
+            self.assertEqual(saved[name], ckpt[name])
         state, name, seed, size, batch = _load_checkpoint(
             out / f"{stem}_best.pt",
             hashlib.sha256(self.manifest.read_bytes()).hexdigest(),
